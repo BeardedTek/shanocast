@@ -1,0 +1,32 @@
+diff --git a/cast/receiver/channel/device_auth_namespace_handler.cc b/cast/receiver/channel/device_auth_namespace_handler.cc
+index 3df16646..e1072447 100644
+--- a/cast/receiver/channel/device_auth_namespace_handler.cc
++++ b/cast/receiver/channel/device_auth_namespace_handler.cc
+@@ -15,6 +15,7 @@
+ #include "cast/common/channel/virtual_connection.h"
+ #include "cast/common/channel/virtual_connection_router.h"
+ #include "platform/base/tls_credentials.h"
++#include "platform/api/time.h"
+ #include "util/crypto/digest_sign.h"
+ 
+ using ::cast::channel::AuthChallenge;
+@@ -25,6 +26,10 @@ using ::cast::channel::DeviceAuthMessage;
+ using ::cast::channel::HashAlgorithm;
+ using ::cast::channel::SignatureAlgorithm;
+ 
++// Dynamic certificate generation includes
++#include <openssl/rsa.h>
++#include <openssl/pem.h>
++
+ namespace openscreen {
+ namespace cast {
+ 
+@@ -32,6 +37,7 @@ namespace cast {
+ 
+ DeviceAuthNamespaceHandler::DeviceAuthNamespaceHandler(
+     CredentialsProvider* creds_provider)
+-    : creds_provider_(creds_provider) {}
++    : creds_provider_(creds_provider) {
++}
+ 
+ DeviceAuthNamespaceHandler::~DeviceAuthNamespaceHandler() = default; 
