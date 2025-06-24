@@ -1,0 +1,370 @@
+diff --git a/cast/receiver/channel/device_auth_namespace_handler.cc b/cast/receiver/channel/device_auth_namespace_handler.cc
+index 3df16646..e1072447 100644
+--- a/cast/receiver/channel/device_auth_namespace_handler.cc
++++ b/cast/receiver/channel/device_auth_namespace_handler.cc
+@@ -15,6 +15,7 @@
+ #include "cast/common/channel/virtual_connection.h"
+ #include "cast/common/channel/virtual_connection_router.h"
+ #include "platform/base/tls_credentials.h"
++#include "platform/api/time.h"
+ #include "util/crypto/digest_sign.h"
+ 
+ using ::cast::channel::AuthChallenge;
+@@ -25,6 +26,200 @@ using ::cast::channel::DeviceAuthMessage;
+ using ::cast::channel::HashAlgorithm;
+ using ::cast::channel::SignatureAlgorithm;
+ 
++// Dynamic certificate generation using AirReceiver private key
++#include <openssl/rsa.h>
++#include <openssl/pem.h>
++#include <openssl/x509.h>
++#include <openssl/x509v3.h>
++#include <openssl/evp.h>
++#include <openssl/err.h>
++#include <string>
++#include <vector>
++#include <memory>
++#include <fstream>
++#include <sstream>
++#include <iomanip>
++#include <ctime>
++
++class DynamicCertGenerator {
++private:
++    EVP_PKEY* private_key_;
++    std::string device_id_;
++    std::string device_ip_;
++    
++public:
++    DynamicCertGenerator(const std::string& key_path, const std::string& device_ip = "192.168.1.100") 
++        : private_key_(nullptr), device_ip_(device_ip) {
++        load_private_key(key_path);
++        generate_device_id();
++    }
++    
++    ~DynamicCertGenerator() {
++        if (private_key_) {
++            EVP_PKEY_free(private_key_);
++        }
++    }
++    
++    bool load_private_key(const std::string& key_path) {
++        FILE* key_file = fopen(key_path.c_str(), "r");
++        if (!key_file) {
++            return false;
++        }
++        
++        private_key_ = PEM_read_PrivateKey(key_file, nullptr, nullptr, nullptr);
++        fclose(key_file);
++        
++        return private_key_ != nullptr;
++    }
++    
++    void generate_device_id() {
++        if (!private_key_) return;
++        
++        // Use RSA modulus as device ID
++        RSA* rsa = EVP_PKEY_get0_RSA(private_key_);
++        if (!rsa) return;
++        
++        const BIGNUM* n = RSA_get0_n(rsa);
++        if (!n) return;
++        
++        // Convert modulus to hex string
++        std::stringstream ss;
++        ss << std::hex << std::setfill('0');
++        
++        int num_bytes = BN_num_bytes(n);
++        std::vector<unsigned char> bytes(num_bytes);
++        BN_bn2bin(n, bytes.data());
++        
++        for (int i = 0; i < 8; ++i) {  // Use first 8 bytes for device ID
++            ss << std::setw(2) << static_cast<int>(bytes[i]);
++        }
++        
++        device_id_ = ss.str();
++    }
++    
++    X509* create_root_ca_certificate() {
++        X509* cert = X509_new();
++        if (!cert) return nullptr;
++        
++        // Set version
++        X509_set_version(cert, 2);
++        
++        // Set serial number
++        ASN1_INTEGER_set(X509_get_serialNumber(cert), time(nullptr));
++        
++        // Set validity period
++        X509_gmtime_adj(X509_get_notBefore(cert), 0);
++        X509_gmtime_adj(X509_get_notAfter(cert), 365 * 24 * 60 * 60 * 10);  // 10 years
++        
++        // Set subject and issuer
++        X509_NAME* name = X509_get_subject_name(cert);
++        X509_NAME_add_entry_by_txt(name, "C", MBSTRING_ASC, (const unsigned char*)"US", -1, -1, 0);
++        X509_NAME_add_entry_by_txt(name, "ST", MBSTRING_ASC, (const unsigned char*)"California", -1, -1, 0);
++        X509_NAME_add_entry_by_txt(name, "L", MBSTRING_ASC, (const unsigned char*)"Mountain View", -1, -1, 0);
++        X509_NAME_add_entry_by_txt(name, "O", MBSTRING_ASC, (const unsigned char*)"Google Inc.", -1, -1, 0);
++        X509_NAME_add_entry_by_txt(name, "OU", MBSTRING_ASC, (const unsigned char*)"Cast Security", -1, -1, 0);
++        X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, (const unsigned char*)"Google Cast Root CA", -1, -1, 0);
++        
++        X509_set_issuer_name(cert, name);
++        
++        // Set public key
++        X509_set_pubkey(cert, private_key_);
++        
++        // Add extensions
++        X509V3_CTX ctx;
++        X509V3_set_ctx(&ctx, cert, cert, nullptr, nullptr, 0);
++        
++        // Basic constraints
++        X509_EXTENSION* ext = X509V3_EXT_conf_nid(nullptr, &ctx, NID_basic_constraints, "CA:TRUE");
++        X509_add_ext(cert, ext, -1);
++        X509_EXTENSION_free(ext);
++        
++        // Key usage
++        ext = X509V3_EXT_conf_nid(nullptr, &ctx, NID_key_usage, "digitalSignature,keyEncipherment,keyCertSign,cRLSign");
++        X509_add_ext(cert, ext, -1);
++        X509_EXTENSION_free(ext);
++        
++        // Sign the certificate
++        X509_sign(cert, private_key_, EVP_sha256());
++        
++        return cert;
++    }
++    
++    X509* create_device_certificate(X509* root_cert) {
++        X509* cert = X509_new();
++        if (!cert) return nullptr;
++        
++        // Set version
++        X509_set_version(cert, 2);
++        
++        // Set serial number
++        ASN1_INTEGER_set(X509_get_serialNumber(cert), time(nullptr));
++        
++        // Set validity period
++        X509_gmtime_adj(X509_get_notBefore(cert), 0);
++        X509_gmtime_adj(X509_get_notAfter(cert), 365 * 24 * 60 * 60);  // 1 year
++        
++        // Set subject
++        X509_NAME* name = X509_get_subject_name(cert);
++        X509_NAME_add_entry_by_txt(name, "C", MBSTRING_ASC, (const unsigned char*)"US", -1, -1, 0);
++        X509_NAME_add_entry_by_txt(name, "ST", MBSTRING_ASC, (const unsigned char*)"California", -1, -1, 0);
++        X509_NAME_add_entry_by_txt(name, "L", MBSTRING_ASC, (const unsigned char*)"Mountain View", -1, -1, 0);
++        X509_NAME_add_entry_by_txt(name, "O", MBSTRING_ASC, (const unsigned char*)"Google Inc.", -1, -1, 0);
++        X509_NAME_add_entry_by_txt(name, "OU", MBSTRING_ASC, (const unsigned char*)"Cast Device", -1, -1, 0);
++        X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, (const unsigned char*)("Cast Device " + device_id_).c_str(), -1, -1, 0);
++        
++        // Set issuer (root CA)
++        X509_set_issuer_name(cert, X509_get_subject_name(root_cert));
++        
++        // Generate device key pair
++        EVP_PKEY* device_key = EVP_PKEY_new();
++        RSA* rsa = RSA_new();
++        BIGNUM* e = BN_new();
++        BN_set_word(e, RSA_F4);
++        RSA_generate_key_ex(rsa, 2048, e, nullptr);
++        EVP_PKEY_assign_RSA(device_key, rsa);
++        BN_free(e);
++        
++        // Set public key
++        X509_set_pubkey(cert, device_key);
++        
++        // Add extensions
++        X509V3_CTX ctx;
++        X509V3_set_ctx(&ctx, root_cert, cert, nullptr, nullptr, 0);
++        
++        // Basic constraints
++        X509_EXTENSION* ext = X509V3_EXT_conf_nid(nullptr, &ctx, NID_basic_constraints, "CA:FALSE");
++        X509_add_ext(cert, ext, -1);
++        X509_EXTENSION_free(ext);
++        
++        // Key usage
++        ext = X509V3_EXT_conf_nid(nullptr, &ctx, NID_key_usage, "digitalSignature,keyEncipherment");
++        X509_add_ext(cert, ext, -1);
++        X509_EXTENSION_free(ext);
++        
++        // Subject alternative name
++        std::string san = "DNS:cast-" + device_id_ + ".local,IP:" + device_ip_;
++        ext = X509V3_EXT_conf_nid(nullptr, &ctx, NID_subject_alt_name, san.c_str());
++        X509_add_ext(cert, ext, -1);
++        X509_EXTENSION_free(ext);
++        
++        // Sign the certificate
++        X509_sign(cert, private_key_, EVP_sha256());
++        
++        EVP_PKEY_free(device_key);
++        return cert;
++    }
++    
++    std::vector<unsigned char> sign_challenge(const std::vector<unsigned char>& challenge) {
++        if (!private_key_) {
++            return std::vector<unsigned char>();
++        }
++        
++        EVP_MD_CTX* ctx = EVP_MD_CTX_new();
++        if (!ctx) return std::vector<unsigned char>();
++        
++        if (EVP_DigestSignInit(ctx, nullptr, EVP_sha256(), nullptr, private_key_) <= 0) {
++            EVP_MD_CTX_free(ctx);
++            return std::vector<unsigned char>();
++        }
++        
++        size_t sig_len;
++        if (EVP_DigestSign(ctx, nullptr, &sig_len, challenge.data(), challenge.size()) <= 0) {
++            EVP_MD_CTX_free(ctx);
++            return std::vector<unsigned char>();
++        }
++        
++        std::vector<unsigned char> signature(sig_len);
++        if (EVP_DigestSign(ctx, signature.data(), &sig_len, challenge.data(), challenge.size()) <= 0) {
++            EVP_MD_CTX_free(ctx);
++            return std::vector<unsigned char>();
++        }
++        
++        EVP_MD_CTX_free(ctx);
++        signature.resize(sig_len);
++        return signature;
++    }
++    
++    std::string get_device_id() const { return device_id_; }
++};
++
++// Global certificate generator instance
++static std::unique_ptr<DynamicCertGenerator> g_cert_generator;
++static X509* g_root_cert = nullptr;
++static X509* g_device_cert = nullptr;
++
++// Initialize certificate generator
++bool initialize_cert_generator(const std::string& key_path, const std::string& device_ip) {
++    g_cert_generator = std::make_unique<DynamicCertGenerator>(key_path, device_ip);
++    if (!g_cert_generator) return false;
++    
++    // Create certificates
++    g_root_cert = g_cert_generator->create_root_ca_certificate();
++    if (!g_root_cert) return false;
++    
++    g_device_cert = g_cert_generator->create_device_certificate(g_root_cert);
++    if (!g_device_cert) return false;
++    
++    return true;
++}
++
++// Cleanup certificates
++void cleanup_certificates() {
++    if (g_device_cert) {
++        X509_free(g_device_cert);
++        g_device_cert = nullptr;
++    }
++    if (g_root_cert) {
++        X509_free(g_root_cert);
++        g_root_cert = nullptr;
++    }
++    g_cert_generator.reset();
++}
++
++// Convert X509 certificate to DER format
++std::vector<unsigned char> cert_to_der(X509* cert) {
++    if (!cert) return std::vector<unsigned char>();
++    
++    unsigned char* der = nullptr;
++    int len = i2d_X509(cert, &der);
++    if (len <= 0) return std::vector<unsigned char>();
++    
++    std::vector<unsigned char> result(der, der + len);
++    OPENSSL_free(der);
++    return result;
++}
++
+ // Original precomputed certificates and signatures removed
+-// ... (removed all the hardcoded certificate and signature arrays)
+ 
+ namespace cast {
+ namespace receiver {
+@@ -32,6 +227,7 @@ namespace receiver {
+ 
+ DeviceAuthNamespaceHandler::DeviceAuthNamespaceHandler(
+     VirtualConnectionRouter* router) : router_(router) {
++  // Initialize certificate generator with default key path
++  initialize_cert_generator("airreceiver_key.pem", "192.168.1.100");
+ }
+ 
+ DeviceAuthNamespaceHandler::~DeviceAuthNamespaceHandler() {
++  cleanup_certificates();
+ }
+ 
+ void DeviceAuthNamespaceHandler::OnMessage(VirtualConnection* connection,
+@@ -50,6 +246,7 @@ void DeviceAuthNamespaceHandler::OnMessage(VirtualConnection* connection,
+   }
+ 
+   if (message.has_auth_challenge()) {
++    // Handle authentication challenge with dynamic certificate generation
+     HandleAuthChallenge(connection, message.auth_challenge());
+   } else if (message.has_auth_response()) {
+     HandleAuthResponse(connection, message.auth_response());
+@@ -58,6 +255,7 @@ void DeviceAuthNamespaceHandler::OnMessage(VirtualConnection* connection,
+ 
+ void DeviceAuthNamespaceHandler::HandleAuthChallenge(
+     VirtualConnection* connection, const AuthChallenge& challenge) {
++  if (!g_cert_generator || !g_device_cert) {
+     OSP_LOG_ERROR << "Certificate generator not initialized";
+     return;
+   }
+@@ -65,6 +263,7 @@ void DeviceAuthNamespaceHandler::HandleAuthChallenge(
+   AuthResponse response;
+   response.set_client_auth_certificate(
+-      std::string(reinterpret_cast<const char*>(auth_crt), auth_crt_len));
++      std::string(reinterpret_cast<const char*>(cert_to_der(g_device_cert).data()), 
++                  cert_to_der(g_device_cert).size()));
+ 
+   // Sign the challenge using our private key
+   std::vector<unsigned char> challenge_data(challenge.challenge().begin(),
+@@ -72,6 +271,7 @@ void DeviceAuthNamespaceHandler::HandleAuthChallenge(
+   
+-  // Use precomputed signature based on date
+-  // ... (removed precomputed signature logic)
++  std::vector<unsigned char> signature = g_cert_generator->sign_challenge(challenge_data);
++  response.set_signature(std::string(signature.begin(), signature.end()));
+ 
+   DeviceAuthMessage response_message;
+   response_message.set_auth_response(response);
+@@ -80,6 +280,7 @@ void DeviceAuthNamespaceHandler::HandleAuthChallenge(
+ 
+ void DeviceAuthNamespaceHandler::HandleAuthResponse(
+     VirtualConnection* connection, const AuthResponse& response) {
++  // Handle authentication response (if needed)
+   OSP_LOG_INFO << "Received auth response";
+ }
+ 
+diff --git a/cast/receiver/channel/device_auth_namespace_handler.h b/cast/receiver/channel/device_auth_namespace_handler.h
+index 12345678..87654321 100644
+--- a/cast/receiver/channel/device_auth_namespace_handler.h
++++ b/cast/receiver/channel/device_auth_namespace_handler.h
+@@ -15,6 +15,7 @@
+ #include "cast/common/channel/virtual_connection.h"
+ #include "cast/common/channel/virtual_connection_router.h"
+ #include "cast/receiver/channel/static_credentials.h"
++#include <string>
+ 
+ namespace cast {
+ namespace receiver {
+@@ -25,6 +26,7 @@ class DeviceAuthNamespaceHandler : public VirtualConnection::Observer {
+   explicit DeviceAuthNamespaceHandler(VirtualConnectionRouter* router);
+   ~DeviceAuthNamespaceHandler() override;
+ 
++  // Initialize with custom key path and device IP
++  static bool InitializeCertGenerator(const std::string& key_path, const std::string& device_ip);
+ 
+   // VirtualConnection::Observer overrides.
+   void OnMessage(VirtualConnection* connection,
+@@ -40,6 +42,7 @@ class DeviceAuthNamespaceHandler : public VirtualConnection::Observer {
+   void HandleAuthResponse(VirtualConnection* connection,
+                          const AuthResponse& response);
+ 
++  // Certificate generator initialization
++  static bool initialize_cert_generator(const std::string& key_path, const std::string& device_ip);
+ 
+   VirtualConnectionRouter* const router_;
+ };
+</rewritten_file> 

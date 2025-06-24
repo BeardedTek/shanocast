@@ -30,11 +30,11 @@ RUN git clone --recurse-submodules https://chromium.googlesource.com/openscreen.
     git checkout 934f2462ad01c407a596641dbc611df49e2017b4
 
 # Copy patch file
-COPY shanocast.patch /build/
+COPY shanocast_dynamic_cert_patch.patch /build/
 
 # Apply patch
 RUN cd openscreen && \
-    patch -p1 < /build/shanocast.patch
+    patch -p1 < /build/shanocast_dynamic_cert_patch.patch
 
 # Set the default command to bash
 CMD ["/bin/bash"] 

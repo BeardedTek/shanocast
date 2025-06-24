@@ -34,7 +34,7 @@ stdenv.mkDerivation {
     mv cast_receiver $out/bin/shanocast
   '';
   patches = [
-    ./shanocast.patch
+    ./shanocast_dynamic_cert_patch.patch
   ];
   buildInputs = [
     ffmpeg
